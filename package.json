@@ -1,0 +1,79 @@
+{
+  "name": "dsh-tts-speakout",
+  "version": "0.1.2",
+  "type": "module",
+  "description": "Speaks a short sentence out loud through the computer's speakers using the user's own cloned voice, so an agent can call the user back to the desk when a long task finishes or their input is needed. Runs a local Qwen3-TTS worker with device targeting, and manages the output channel, volume and voice references in Settings.",
+  "main": "./lib/index.js",
+  "icon": "./icon.svg",
+  "meta": {
+    "title": "dsh-tts-speakout",
+    "description": "Speaks a short sentence out loud through the computer's speakers using the user's own cloned voice, so an agent can call the user back to the desk when a long task finishes or their input is needed. The output channel, volume and voice references are managed in Settings; the model can only choose what to say."
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./tools": "./lib/tools.js",
+    "./typert": "./lib/contracts.js",
+    "./client": "./lib/client.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "lib",
+    "locale",
+    "python/audio_out.py",
+    "python/env_bootstrap.py",
+    "python/tts_worker.py",
+    "python/volume_ctl.py",
+    "scripts/check-reference.py",
+    "cordis.patch.yml",
+    "icon.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build:client": "node scripts/build-client.mjs",
+    "check:client": "node scripts/build-client.mjs --check",
+    "test:host": "node scripts/test-host.mjs",
+    "test:preview": "node scripts/probe-preview.mjs",
+    "test:worker": "node scripts/worker-probe.mjs",
+    "push:api": "node scripts/push-via-api.mjs",
+    "prepublishOnly": "node scripts/build-client.mjs --check"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "tts",
+    "text-to-speech",
+    "voice-clone",
+    "speaker",
+    "speak-out"
+  ],
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-locale",
+        "@deepseek-ai/dsh-api-remotes",
+        "slots"
+      ]
+    }
+  },
+  "dependencies": {
+    "zod": "^4.4.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": ">=0.1.0-rc.5 <0.3.0",
+    "@deepseek-ai/dsh-typert-protocol": ">=0.1.0-rc.5 <0.3.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.28.1"
+  }
+}

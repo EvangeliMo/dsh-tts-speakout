@@ -1,0 +1,10 @@
+# dsh-tts-speakout bundle patch: mount the host service row + the agent-tool row.
+# The client half (the "Speaker speak-out" Settings page) is discovered through
+# dsh.client; the host wire contracts load through the ./typert export; the
+# model-facing tools (dsh_speak / dsh_tts_status / ...) load through ./tools.
+- insert:
+    - id: dsh-tts-speakout
+      name: dsh-tts-speakout
+
+    - id: dsh-tts-speakout-tools
+      name: dsh-tts-speakout/tools

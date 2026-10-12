@@ -1,0 +1,67 @@
+node_modules/
+npm-debug.log*
+*.tmp
+*.bak
+.DS_Store
+Thumbs.db
+
+# Python bytecode caches: `files` in package.json ships python/, so a stray
+# __pycache__ would be packaged into the plugin on install.
+__pycache__/
+*.py[cod]
+
+# Local scratch used by scripts/test-host.mjs (fake $DSH_HOME)
+.test-home/
+
+# Runtime output of the inference worker when pointed at the checkout
+python/out/
+venv/
+.pytest_cache/
+
+# ---------------------------------------------------------------------------
+# Audio assets: block everything, allow exactly one reviewed directory.
+#
+# Voice presets normally live in the plugin's DATA directory
+# (`$DSH_HOME/tts-speakout/voices/<id>/`), not in this package, so they are
+# outside version control by construction. These rules are the belt-and-braces
+# guard: cloned reference audio frequently carries third-party copyright (game
+# or anime voice samples, for instance) and must never be redistributed.
+#
+# The `!assets/**` negation is what lets a reviewed, freely licensed default
+# voice ship. It is written against the `assets/` DIRECTORY rather than as
+# `!**/*.wav`, because gitignore wildcards do not cross `/` — `!**/*.wav` would
+# silently match nothing and the default voice would stay ignored.
+#
+# Only freely licensed material (CC0 / public domain / CC-BY) may go in assets/.
+# ---------------------------------------------------------------------------
+# Audio assets: blocked outright, with NO exception.
+#
+# This plugin ships **no voice material at all**. Voice presets live in the
+# plugin's DATA directory (`$DSH_HOME/tts-speakout/voices/<id>/`), created by the
+# user importing their own reference clip, so they are outside version control by
+# construction and never travel with the plugin.
+#
+# The blanket rules below are therefore a hard guard rather than a formality:
+# cloned reference audio very often carries third-party copyright (game or anime
+# voice samples, for instance). During development this repo was deliberately
+# kept free of any such file, and that must stay true for anyone who forks it.
+#
+# If a freely licensed default voice is ever added on purpose, ship it under an
+# explicit `assets/` directory AND add the matching un-ignore rules together
+# with its licence/attribution file — never widen these rules "just in case".
+# ---------------------------------------------------------------------------
+*.wav
+*.mp3
+*.flac
+*.m4a
+*.ogg
+*.aac
+*.opus
+
+# Scratch locations that must never be committed: candidate research, downloaded
+# corpora, screening tables, and per-candidate metadata.
+voice-scout/
+voice-candidates/
+voices/
+ref_audio/
+models/
