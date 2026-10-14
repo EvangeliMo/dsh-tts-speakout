@@ -204,23 +204,37 @@ class Worker:
     def resolve_device_index(self) -> int:
         if not self.devices:
             self.refresh_devices()
-        chosen = audio_out.resolve_device(self.devices, self.device_spec)
-        if chosen is None:
+        # Probe-based: an endpoint that cannot be opened must never be selected,
+        # or a speak-out would "succeed" while producing no sound.
+        candidates = audio_out.devices_for_spec(self.devices, self.device_spec)
+        if not candidates:
             raise audio_out.AudioError(
-                "指定的输出通道不可用（%s）。可用通道: %s"
+                "指定的输出通道当前不可用（%s）。可用通道: %s"
                 % (self.device_spec or "自动", self.device_names() or "（枚举不到任何输出设备）")
             )
-        self.active_device = chosen
-        return int(chosen["index"])
+        self.active_device = candidates[0]
+        return int(self.active_device["index"])
 
-    def device_names(self, limit: int = 12) -> str:
-        """Friendly names of the endpoints that currently exist, for error text.
+    def device_names(self, limit: int = 12, reachable_only: bool = True) -> str:
+        """Friendly names of endpoints, for error text.
 
-        Included so a caller that asked for a wrong channel learns the valid
-        names from the same reply instead of guessing repeatedly.
+        Defaults to endpoints Windows reports as ACTIVE: telling a caller that
+        "耳机" is available when the jack is empty would be worse than saying
+        nothing. Included so a caller that asked for a wrong channel learns the
+        valid names from the same reply instead of guessing repeatedly.
         """
-        names = [str(d.get("name") or "") for d in self.devices]
-        names = [n for n in names if n]
+        rows = self.devices
+        if reachable_only:
+            live = [d for d in rows if d.get("reachable") is not False]
+            if live:
+                rows = live
+        # De-duplicate: DirectSound/WASAPI/WDM-KS expose the same endpoint under
+        # the same name, and a 25-item list buries the useful part.
+        names: list[str] = []
+        for d in rows:
+            name = str(d.get("name") or "")
+            if name and name not in names:
+                names.append(name)
         if not names:
             return ""
         if len(names) > limit:
@@ -231,9 +245,14 @@ class Worker:
         """Validate a caller-requested output channel and return its index.
 
         Re-enumerates the OS first: this runs as a pre-flight check on every
-        speak-out, and the whole point is to fail fast when a channel has since
-        disappeared (headphones unplugged, device disabled), so the cached list
-        is not good enough. Raises AudioError when the channel is unavailable.
+        speak-out, and the whole point is to fail fast when a channel is not
+        actually usable (headphones unplugged, device disabled), so the cached
+        list is not good enough.
+
+        Availability is decided by actually opening the endpoint, not by its
+        name: the Realtek headphone jack is enumerated as "耳机 ()" even when
+        nothing is plugged in, so a name test would happily accept it. Raises
+        AudioError when the channel cannot be used.
         """
         spec = str(device or "").strip()
         self.refresh_devices()
@@ -241,15 +260,30 @@ class Worker:
             raise audio_out.AudioError(
                 "当前枚举不到任何音频输出设备，无法确定输出通道「%s」是否可用。" % spec
             )
-        chosen = audio_out.resolve_device(self.devices, spec)
-        if chosen is None:
+
+        matches = audio_out.name_matches_candidates(self.devices, spec)
+        if not matches:
             raise audio_out.AudioError(
-                "指定的输出通道不可用（%s）。可用通道: %s" % (spec, self.device_names())
+                "指定的输出通道不存在（%s）。可用通道: %s" % (spec, self.device_names())
             )
-        self.active_device = chosen
+
+        working = audio_out.devices_for_spec(self.devices, spec)
+        if not working:
+            # The name matched, but no endpoint behind it can be opened: a jack
+            # with nothing plugged in, or a disabled device. Saying so beats a
+            # generic failure, because the fix ("plug it in") differs from
+            # "pick another channel".
+            found = " / ".join(sorted({str(r.get("name", "")) for r in matches})[:3])
+            raise audio_out.AudioError(
+                "指定的输出通道当前不可用（%s，匹配到 %s）。"
+                "它可能没有插入或已被禁用；当前可用的通道: %s"
+                % (spec, found, self.device_names())
+            )
+
+        self.active_device = working[0]
         log("info", "按调用方要求使用输出通道: %s (%s)"
-            % (chosen["name"], chosen["hostapi"]))
-        return int(chosen["index"])
+            % (self.active_device["name"], self.active_device["hostapi"]))
+        return int(self.active_device["index"])
 
     # ------------------------------------------------------------ voices
 

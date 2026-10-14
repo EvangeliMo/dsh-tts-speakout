@@ -96,7 +96,162 @@ def list_output_devices(prefer_windows: bool = True) -> list[dict[str, Any]]:
     for row in rows:
         row["suggested"] = bool(suggested and row["index"] == suggested["index"])
         row["virtual"] = any(m in row["name"].lower() for m in _VIRTUAL_MARKERS)
+
+    # Mark reachability cheaply, from the Core Audio ACTIVE set. PortAudio
+    # happily enumerates endpoints Windows has already marked inactive — an
+    # unplugged headphone jack, for instance — so "the device is listed" is NOT
+    # the same as "sound would come out of it". A name match is only a hint;
+    # `probe_device()` is the authoritative test and is used at resolve time.
+    active = active_endpoint_names()
+    if active is not None:
+        for row in rows:
+            row["reachable"] = _endpoint_is_active(str(row.get("name", "")), active)
     return rows
+
+
+_PROBE_CACHE: dict[tuple[int, str], tuple[float, bool]] = {}
+_PROBE_TTL_OK = 60.0      # an endpoint that works stays working for a while
+_PROBE_TTL_FAIL = 2.0     # re-test quickly: the user may have just plugged in
+_PROBE_TIMEOUT = 10.0     # a hung driver must not stall a pre-flight check
+
+
+def probe_device(index: int, hostapi: str = "") -> bool:
+    """Can a stream actually be opened on this endpoint right now?
+
+    This is the authoritative availability test. Opening a dead jack fails with
+    PortAudio's "Unanticipated host error" (WDM-KS), while every live endpoint
+    accepts a stream, so this distinguishes "listed" from "usable" where name
+    matching cannot — two jacks on one sound card share their friendly name.
+
+    The stream is opened and closed WITHOUT writing audio, so nothing is heard.
+    Results are cached with a short TTL so a failure is re-checked quickly (the
+    user may have just plugged headphones in) while success stays cheap.
+    """
+    key = (int(index), str(hostapi))
+    now = time.time()
+    cached = _PROBE_CACHE.get(key)
+    if cached is not None:
+        age = now - cached[0]
+        if cached[1] and age < _PROBE_TTL_OK:
+            return True
+        if not cached[1] and age < _PROBE_TTL_FAIL:
+            return False
+
+    ok = False
+    try:
+        import sounddevice as sd  # noqa: PLC0415
+
+        info = sd.query_devices(int(index))
+        rate = int(float(info.get("default_samplerate") or 48000)) or 48000
+        channels = min(2, int(info.get("max_output_channels") or 1)) or 1
+        stream = sd.OutputStream(device=int(index), samplerate=rate,
+                                 channels=channels, dtype="float32", latency="low")
+        try:
+            stream.start()
+            stream.stop()
+        finally:
+            stream.close()
+        ok = True
+    except Exception:  # noqa: BLE001 — any failure means "cannot use it now"
+        ok = False
+    _PROBE_CACHE[key] = (now, ok)
+    return ok
+
+
+def clear_probe_cache() -> None:
+    _PROBE_CACHE.clear()
+
+
+def _probe(row: dict[str, Any]) -> bool:
+    """Single indirection point for the availability test.
+
+    Device selection routes through here so tests can substitute the probe
+    without opening real hardware (see scripts/test-audio-select.py).
+    """
+    return probe_device(int(row["index"]), str(row.get("hostapi", "")))
+
+
+def probe_candidates(candidates: list[dict[str, Any]], limit: int | None = None) -> dict[str, Any] | None:
+    """First candidate (best-ranked first) that can actually be opened."""
+    for row in (candidates if limit is None else candidates[:limit]):
+        if _probe(row):
+            return row
+    return None
+
+
+def active_endpoint_names() -> set[str] | None:
+    """Friendly names Windows currently reports as ACTIVE render endpoints.
+
+    `None` means the query itself failed, which callers must treat as "unknown"
+    (do not filter on it) rather than "nothing is reachable".
+    """
+    try:
+        import endpoint_state  # noqa: PLC0415 (same directory, imported lazily)
+        rows = endpoint_state.active_render_endpoints()
+    except Exception:  # noqa: BLE001
+        return None
+    if not rows:
+        return set()
+    return {str(r.get("name") or "") for r in rows if r.get("name")}
+
+
+def _role_of(name: str) -> str:
+    """The role prefix Windows puts in front of an endpoint name.
+
+    "扬声器 (Realtek(R) Audio)" -> "扬声器"; "耳机 (Realtek(R) Audio)" ->
+    "耳机"; "VoiceMeeter Input (VB-Audio ...)" -> "voicemeeter input".
+    A name without parentheses has no role and yields "".
+    """
+    text = str(name or "").strip()
+    if "(" not in text:
+        return ""
+    return text.split("(", 1)[0].strip().lower()
+
+
+def _normalize_role(role: str) -> str:
+    return str(role or "").strip().lower()
+
+
+def _endpoint_is_active(name: str, active: set[str]) -> bool:
+    """Does this PortAudio device name correspond to an ACTIVE endpoint?
+
+    This is only a HINT (the settings page shows it, and it pre-filters), because
+    PortAudio's own label is lossy: the Realtek headphone jack is reported as
+    "耳机 ()" with an EMPTY parenthetical while Windows calls the endpoint
+    "耳机 (Realtek(R) Audio)". Name matching therefore cannot decide
+    availability; `probe_device()` does, at resolve time.
+
+    Two endpoints of one sound card also share the adapter name ("耳机
+    (Realtek(R) Audio)" vs "扬声器 (Realtek(R) Audio)"), so a plain substring
+    test would accept an unplugged jack merely because the speakers are active.
+    The tiered comparison below never confuses the two.
+    """
+    needle = str(name or "").strip().lower()
+    if not needle or not active:
+        return False
+    candidates = sorted(active, key=len)
+    for candidate in candidates:
+        if needle == candidate.lower():
+            return True
+
+    needle_role = _normalize_role(_role_of(needle))
+    # PortAudio's label may carry an empty or adapter-only parenthetical; compare
+    # on the role alone when both sides have one.
+    if needle_role:
+        for candidate in candidates:
+            low = candidate.lower()
+            if needle_role == _normalize_role(_role_of(low)) and needle.split("(", 1)[0].strip() in low:
+                return True
+        return False
+
+    # No role on our side ("Speakers (Realtek HD Audio output with SST)"): accept
+    # containment, but never let a role-less label match a *different* role.
+    for candidate in candidates:
+        low = candidate.lower()
+        if needle in low or low in needle:
+            return True
+    return False
+
 
 
 def score_devices(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -122,8 +277,58 @@ def score_devices(rows: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
     return sorted(rows, key=key)
 
 
+def name_matches_candidates(devices: list[dict[str, Any]], wanted: str) -> list[dict[str, Any]]:
+    """Every endpoint whose friendly name contains `wanted`, best-ranked first.
+
+    Splitting this out lets the worker probe the SAME set it later reports on, so
+    "which devices do you mean" and "which one is usable" cannot disagree.
+    """
+    spec = str(wanted or "").strip()
+    if not spec:
+        return []
+    if spec.isdigit():
+        return [row for row in devices if int(row["index"]) == int(spec)]
+    needle = spec.lower()
+    return score_devices([r for r in devices if needle in str(r.get("name", "")).lower()])
+
+
+def devices_for_spec(devices: list[dict[str, Any]], wanted: str | None) -> list[dict[str, Any]]:
+    """Candidate endpoints for `wanted` that can actually be opened, best first.
+
+    Availability is decided by `probe_device()`, never by name: the Realtek
+    headphone jack is enumerated as "耳机 ()" even with nothing plugged in, so a
+    name/active-list test both fails open on this machine. Probing costs one
+    stream open per candidate and is cached, and the ranked-first order means the
+    usual answer is found on the first try.
+    """
+    if not devices:
+        return []
+    spec = str(wanted or "").strip()
+    if not spec:
+        ranked = score_devices(devices)
+        # Core Audio already told us which endpoints are inactive; skip those
+        # instead of paying for a doomed open.
+        ranked = [r for r in ranked if r.get("reachable") is not False] or ranked
+        probeable = [r for r in ranked if r.get("reachable") is True]
+        rest = [r for r in ranked if r.get("reachable") is not True]
+        working = probe_candidates(probeable + rest)
+        return [working] if working else []
+
+    hits = name_matches_candidates(devices, spec)
+    if not hits:
+        return []
+    # Try the plausible ones first, then the ones the cheap check disliked.
+    # A name match that cannot be opened is NOT a candidate: reporting it would
+    # recreate exactly the bug this guards against ("headphones are fine" while
+    # the jack is empty). The caller distinguishes "no such name" from
+    # "matched but unusable" via name_matches_candidates().
+    live = [r for r in hits if r.get("reachable") is not False]
+    other = [r for r in hits if r.get("reachable") is False]
+    return [r for r in live + other if _probe(r)]
+
+
 def resolve_device(devices: list[dict[str, Any]], wanted: str | None) -> dict[str, Any] | None:
-    """Resolve a device spec to one endpoint.
+    """Resolve a device spec to the best endpoint that can be opened.
 
     `wanted` may be a friendly-name substring (case-insensitive) or a plain
     device index. An empty/None spec means "pick automatically".
@@ -131,19 +336,27 @@ def resolve_device(devices: list[dict[str, Any]], wanted: str | None) -> dict[st
     if not devices:
         return None
     spec = (wanted or "").strip()
-    if not spec:
-        return score_devices(devices)[0]
-
-    if spec.isdigit():
-        for row in devices:
-            if int(row["index"]) == int(spec):
-                return row
-
-    needle = spec.lower()
-    hits = [row for row in devices if needle in str(row["name"]).lower()]
-    if not hits:
+    candidates = devices_for_spec(devices, spec if spec else None)
+    if not candidates:
         return None
-    return score_devices(hits)[0]
+    return candidates[0]
+
+
+def unreachable_matches(devices: Iterable[dict[str, Any]], wanted: str) -> list[str]:
+    """Names matching `wanted` that exist but are NOT reachable right now.
+
+    Lets a caller say "the headphones exist but are not plugged in" instead of a
+    misleading "device not found".
+    """
+    needle = str(wanted or "").strip().lower()
+    if not needle:
+        return []
+    found = {
+        str(r.get("name", ""))
+        for r in devices
+        if needle in str(r.get("name", "")).lower() and r.get("reachable") is False
+    }
+    return sorted(found)
 
 
 def resample(mono, source_rate: int, target_rate: int):
