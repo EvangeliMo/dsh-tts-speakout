@@ -162,7 +162,7 @@ def clear_probe_cache() -> None:
     _PROBE_CACHE.clear()
 
 
-def _probe(row: dict[str, Any]) -> bool:
+def probe(row: dict[str, Any]) -> bool:
     """Single indirection point for the availability test.
 
     Device selection routes through here so tests can substitute the probe
@@ -174,7 +174,7 @@ def _probe(row: dict[str, Any]) -> bool:
 def probe_candidates(candidates: list[dict[str, Any]], limit: int | None = None) -> dict[str, Any] | None:
     """First candidate (best-ranked first) that can actually be opened."""
     for row in (candidates if limit is None else candidates[:limit]):
-        if _probe(row):
+        if probe(row):
             return row
     return None
 
@@ -324,18 +324,166 @@ def devices_for_spec(devices: list[dict[str, Any]], wanted: str | None) -> list[
     # "matched but unusable" via name_matches_candidates().
     live = [r for r in hits if r.get("reachable") is not False]
     other = [r for r in hits if r.get("reachable") is False]
-    return [r for r in live + other if _probe(r)]
+    return [r for r in live + other if probe(r)]
 
 
-def resolve_device(devices: list[dict[str, Any]], wanted: str | None) -> dict[str, Any] | None:
-    """Resolve a device spec to the best endpoint that can be opened.
+# The four slots a caller (the agent) may name. A fixed vocabulary means a model
+# never has to guess a driver string, and the same request keeps working when the
+# user's language, adapter name or hardware changes.
+#
+# All four are BOUND BY THE USER to real endpoints — none is derived from another.
+# `primary` / `backup` are the two most-used ports and `speakers` / `headphones`
+# name the two kinds of output; but the binding is uniform, so the user can point
+# any of them wherever they like. Unbound slots fall back to a sensible default
+# (speaker-like for `speakers`, headset-like for `headphones`, the automatic
+# ranking for `primary`/`backup`).
+SLOT_NAMES = ("primary", "backup", "speakers", "headphones")
 
-    `wanted` may be a friendly-name substring (case-insensitive) or a plain
-    device index. An empty/None spec means "pick automatically".
+# Loose synonyms, so a non-English request ("用扬声器") still lands on a slot.
+SLOT_ALIASES = {
+    "primary": "primary",
+    "main": "primary",
+    "default": "primary",
+    "默认": "primary",
+    "默认通道": "primary",
+    "首选": "primary",
+    "backup": "backup",
+    "fallback": "backup",
+    "secondary": "backup",
+    "备用": "backup",
+    "后备": "backup",
+    "speakers": "speakers",
+    "speaker": "speakers",
+    "扬声器": "speakers",
+    "音箱": "speakers",
+    "headphones": "headphones",
+    "headphone": "headphones",
+    "耳机": "headphones",
+}
+
+
+def slot_of(name: str) -> str:
+    """Map a caller-supplied name onto one of the four slots, or ''."""
+    return SLOT_ALIASES.get(str(name or "").strip().lower(), "")
+
+
+def port_candidates(devices: list[dict[str, Any]], slot: str,
+                    bindings: dict[str, str] | None = None) -> list[dict[str, Any]]:
+    """Endpoints for one slot, best-first.
+
+    A slot is either bound by the user to a specific device (substring match) or
+    left empty, in which case a sensible default applies: `speakers` looks for
+    loudspeaker-like names, `headphones` for headset-like names, and
+    `primary`/`backup` use the automatic ranking. Every candidate must actually
+    open, so a dead jack can never be returned.
+    """
+    name = slot_of(slot)
+    if name not in SLOT_NAMES:
+        return []
+    spec = str((bindings or {}).get(name, "") or "").strip()
+    # A binding may name ANOTHER slot ("primary = speakers"), which is the most
+    # natural way for a user to say "my main output is the speakers". Follow it
+    # one level; a self- or mutually-referencing binding is a config mistake, not
+    # a loop to spin in.
+    if spec:
+        indirect = slot_of(spec)
+        if indirect and indirect != name:
+            return port_candidates(devices, indirect, bindings)
+        if indirect:
+            spec = ""
+    if spec:
+        return devices_for_spec(devices, spec)
+
+    ranked = score_devices(devices)
+    if name == "speakers":
+        markers = _SPEAKER_MARKERS
+    elif name == "headphones":
+        markers = _HEADPHONE_MARKERS
+    else:
+        markers = ()
+    if markers:
+        hits = [r for r in ranked if any(m in str(r.get("name", "")).lower() for m in markers)]
+        live = [r for r in hits if r.get("reachable") is not False]
+        other = [r for r in hits if r.get("reachable") is False]
+        candidates = [r for r in live + other if probe(r)]
+        if candidates:
+            return candidates
+    return devices_for_spec(devices, None)
+
+
+def resolve_slot(devices: list[dict[str, Any]], slot: str,
+                 bindings: dict[str, str] | None = None) -> dict[str, Any] | None:
+    """Resolve one slot to an endpoint, for showing it in the settings page."""
+    candidates = port_candidates(devices, slot, bindings)
+    return candidates[0] if candidates else None
+
+
+def resolve_chain(devices: list[dict[str, Any]], chain: Iterable[str],
+                  bindings: dict[str, str] | None = None,
+                  strict: bool = False) -> dict[str, Any] | None:
+    """First *reachable* endpoint along an ordered chain of slots.
+
+    This is what `primary` -> `backup` means: "prefer this, but if it is not
+    usable, use the next one". `strict=True` instead requires the FIRST entry to
+    resolve, which is how a channel request stays strict (silently switching
+    channels would hide that the requested one is gone).
+
+    Returns `{"device", "used", "slot", "index", "tried"}` so the caller can tell
+    the user *which* slot actually won and which ones were skipped.
+    """
+    entries: list[str] = []
+    for raw in chain or []:
+        item = slot_of(raw)
+        if item and item not in entries:
+            entries.append(item)
+    if not entries:
+        return None
+
+    tried: list[str] = []
+    for index, entry in enumerate(entries):
+        candidates = port_candidates(devices, entry, bindings)
+        if candidates:
+            return {"device": candidates[0], "used": entry, "slot": entry,
+                    "index": index, "tried": tried}
+        tried.append(entry)
+        if strict:
+            break
+    return None
+
+
+def expand_chain(bindings: dict[str, str] | None = None) -> list[str]:
+    """The ordered slot chain the routing decision walks.
+
+    `primary` -> `backup` first — they are the two the agent uses most — then the
+    rest. Every slot is always present: an unbound slot still resolves through its
+    default (speaker-like for `speakers`, headset-like for `headphones`, the
+    automatic ranking for `primary`/`backup`), so the chain never stalls and a
+    bound port is never dead weight.
+    """
+    chain: list[str] = []
+    for slot in ("primary", "backup"):
+        if slot not in chain:
+            chain.append(slot)
+    for slot in SLOT_NAMES:
+        if slot not in chain:
+            chain.append(slot)
+    return chain
+
+
+def resolve_device(devices: list[dict[str, Any]], wanted: str | None,
+                   bindings: dict[str, str] | None = None) -> dict[str, Any] | None:
+    """Resolve one name to an endpoint that can be opened.
+
+    `wanted` may be any of the four slots (`primary` / `backup` / `speakers` /
+    `headphones`), a friendly-name substring (case-insensitive), or a plain device
+    index. An empty/None spec means "pick automatically".
     """
     if not devices:
         return None
-    spec = (wanted or "").strip()
+    spec = str(wanted or "").strip()
+    name = slot_of(spec)
+    if name:
+        return resolve_slot(devices, name, bindings)
     candidates = devices_for_spec(devices, spec if spec else None)
     if not candidates:
         return None

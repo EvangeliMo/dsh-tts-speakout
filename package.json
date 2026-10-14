@@ -1,6 +1,6 @@
 {
   "name": "dsh-tts-speakout",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "type": "module",
   "description": "Speaks a short sentence out loud through the computer's speakers using the user's own cloned voice, so an agent can call the user back to the desk when a long task finishes or their input is needed. Runs a local Qwen3-TTS worker with device targeting, and manages the output channel, volume and voice references in Settings.",
   "main": "./lib/index.js",

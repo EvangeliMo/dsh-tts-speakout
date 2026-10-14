@@ -56,14 +56,31 @@ const zh = {
   deviceRecommended: '（推荐）',
   deviceDefault: '（系统默认）',
   deviceNone: '没有枚举到输出设备',
+  deviceUnreachable: '（未插/不可用）',
+  // The four names the agent is allowed to use. `primary`/`backup` are the two
+  // slots used for ordinary announcements; `speakers`/`headphones` name the two
+  // kinds of output. Each is bound by the user, independently.
+  slot_primary: '默认输出（primary）',
+  slot_backup: '备用输出（backup）',
+  slot_speakers: '扬声器（speakers）',
+  slot_headphones: '耳机（headphones）',
+  slotDesc_primary: '用户没指定输出口时，喊话走这里',
+  slotDesc_backup: '默认输出不可用时改用它；两个都不可用则放弃喊话',
+  slotDesc_speakers: '用户明确要求「用扬声器」时走这里',
+  slotDesc_headphones: '用户明确要求「用耳机」时走这里',
+  slotDefault: '未绑定（按类型自动判断）',
+  slotDefaultHint: '由插件按名称推断：扬声器槽找音箱类端点，耳机槽找耳机类端点',
+  bindingOk: '可用',
+  bindingUnreachable: '当前不可用',
+  bindingMissing: '未找到该设备',
   rescan: '重新枚举',
   rescanning: '枚举中…',
   rescanDone: '已重新枚举，共 {count} 个输出设备',
   effective: '喊话输出通道',
-  effectiveAuto: '（自动选择的扬声器）',
-  effectiveHint: '这是 worker 实际打开的端点：agent 喊话与上方「试听」都走它。选一个具体设备即可固定，不再依赖系统默认。',
+  effectiveAuto: '（自动选择）',
+  effectiveHint: '这是 worker 实际打开的端点：agent 喊话与上方「试听」都走它。',
   autoPick: '自动优先扬声器（避免选中耳机）',
-  autoPickHint: '默认开启：人不在电脑前时戴不上耳机，声音必须从扬声器出来。',
+  autoPickHint: '兜底用：仅在四个槽位都没绑定时生效。',
   volumeTitle: '音量',
   volumeLabel: '音量',
   volumeSaved: '音量已保存为 {percent}%',
@@ -134,16 +151,30 @@ const en = {
   deviceAuto: 'Follow the system default',
   deviceAutoHint: 'let "prefer speakers" pick a loudspeaker endpoint',
   deviceNone: 'No output devices were enumerated',
+  deviceUnreachable: ' (unplugged/unavailable)',
+  slot_primary: 'Default output (primary)',
+  slot_backup: 'Backup output (backup)',
+  slot_speakers: 'Speakers (speakers)',
+  slot_headphones: 'Headphones (headphones)',
+  slotDesc_primary: 'where speak-outs go when the user named no output',
+  slotDesc_backup: 'used when the default output is unusable; if both fail, give up',
+  slotDesc_speakers: 'used when the user explicitly asks for "the speakers"',
+  slotDesc_headphones: 'used when the user explicitly asks for "my headphones"',
+  slotDefault: 'Not bound (inferred by kind)',
+  slotDefaultHint: 'inferred from the name: the speakers slot looks for loudspeaker-like endpoints, headphones for headset-like ones',
+  bindingOk: 'available',
+  bindingUnreachable: 'currently unavailable',
+  bindingMissing: 'device not found',
   deviceRecommended: ' (recommended)',
   deviceDefault: ' (system default)',
   rescan: 'Re-enumerate',
   rescanning: 'Enumerating…',
   rescanDone: 'Re-enumerated: {count} output devices',
   effective: 'Speak-out channel',
-  effectiveAuto: ' (auto-picked speaker)',
-  effectiveHint: 'The endpoint the worker actually opened: both the agent speak-outs and the preview above use it. Pick a concrete device to pin it instead of relying on the system default.',
+  effectiveAuto: ' (auto-picked)',
+  effectiveHint: 'The endpoint the worker actually opened: both the agent speak-outs and the preview above use it.',
   autoPick: 'Prefer loudspeakers over headphones',
-  autoPickHint: 'On by default: headphones are useless when nobody is at the desk, so the sound must come from the speakers.',
+  autoPickHint: 'Fallback only: applies when none of the four slots is bound.',
   volumeTitle: 'Volume',
   volumeLabel: 'Volume',
   volumeSaved: 'Volume saved as {percent}%',
@@ -348,6 +379,15 @@ function TtsSection({ api, t }) {
   const [deviceDiag, setDeviceDiag] = React.useState(null);
   const [voices, setVoices] = React.useState(null);
   const [deviceChoice, setDeviceChoice] = React.useState('');
+  /**
+   * The user's binding for each of the four slots the agent may name. Kept as an
+   * object because they are independent: `primary` / `backup` are the two slots
+   * used for ordinary announcements and `speakers` / `headphones` name the two
+   * kinds of output, but nothing is derived from anything else.
+   */
+  const [bindings, setBindings] = React.useState({ primary: '', backup: '', speakers: '', headphones: '' });
+  /** Which slot's device list is currently expanded ('' = none). */
+  const [editingSlot, setEditingSlot] = React.useState('');
   const [volume, setVolume] = React.useState(null);
   const [autoPick, setAutoPick] = React.useState(true);
   const [busy, setBusy] = React.useState('');
@@ -378,6 +418,14 @@ function TtsSection({ api, t }) {
     // `status().device` is the *effective* endpoint. When autoPickSpeaker
     // chose it, the persisted choice is still "follow the system default".
     setDeviceChoice(st.autoPicked ? '' : (st.device || ''));
+    if (st.slotBindings && typeof st.slotBindings === 'object') {
+      setBindings({
+        primary: String(st.slotBindings.primary || ''),
+        backup: String(st.slotBindings.backup || ''),
+        speakers: String(st.slotBindings.speakers || ''),
+        headphones: String(st.slotBindings.headphones || ''),
+      });
+    }
   }, []);
 
   const load = React.useCallback(async (opts) => {
@@ -463,6 +511,35 @@ function TtsSection({ api, t }) {
       setNotice({ kind: 'err', text: txt(res, 'message') || t('unknownError') });
     }
   });
+
+  /* ---- slot bindings (the only names the agent may use) ---- */
+
+  const SLOTS = ['primary', 'backup', 'speakers', 'headphones'];
+
+  /** Persist one slot's binding, leaving the other three alone. */
+  const changeBinding = guard(async (slot, deviceName) => {
+    const next = { ...bindings, [slot]: deviceName };
+    setBindings(next);
+    const res = await api.saveConfig({ slotBindings: next });
+    if (!alive.current) return;
+    applyStatus(res);
+    if (res.ok === false) setNotice({ kind: 'err', text: txt(res, 'message') || t('unknownError') });
+  });
+
+  /**
+   * What a binding currently resolves to. Mirrors the worker's rule: a binding
+   * is a device-name substring, and an empty binding means "use this slot's
+   * default" (speaker-like for `speakers`, headset-like for `headphones`, the
+   * automatic pick for `primary`/`backup`).
+   */
+  const resolvedFor = React.useCallback((bound) => {
+    if (!bound) return '';
+    const needle = String(bound).toLowerCase();
+    const hit = (rows || []).find((d) => txt(d, 'name').toLowerCase().includes(needle));
+    if (!hit) return t('bindingMissing');
+    if (hit.reachable === false) return t('bindingUnreachable');
+    return t('bindingOk');
+  }, [rows, t]);
 
   /* ---- block 2: volume ---- */
 
@@ -604,20 +681,11 @@ function TtsSection({ api, t }) {
 
   /* ---- render ---- */
 
-  // NOTE: no hooks may appear past this point — there is an early return below,
-  // and calling a hook after it makes the hook count vary between renders
-  // (React error #300, "rendered fewer hooks than expected"). The endpoint rows
-  // are therefore derived inline.
-
-  if (status === null && busy === 'load') {
-    return React.createElement('div', { className: 'dshtts-section' },
-      React.createElement('h2', { className: 'dshtts-heading' }, t('heading')),
-      React.createElement('p', { className: 'dshtts-intro' }, t('loading')));
-  }
-
-  const percent = volume === null ? 80 : Math.round(clamp01(volume) * 100);
-  const list = voices || [];
+  // The endpoint rows are derived BEFORE the early return below: `resolvedFor`
+  // (a hook) already depends on them, and deriving them past the return would
+  // make the hook read a stale/undefined value on the loading render.
   const deviceList = devices || [];
+  const list = voices || [];
   const effective = status ? txt(status, 'device') : '';
   const configured = deviceChoice || '';
   // A configured endpoint the enumeration did not report still needs a row, or
@@ -626,6 +694,18 @@ function TtsSection({ api, t }) {
   if (configured && !rows.some((d) => txt(d, 'name') === configured)) {
     rows.push({ name: configured, hostapi: '', suggested: false, default: false });
   }
+
+  // NOTE: no hooks may appear past this point — there is an early return below,
+  // and calling a hook after it makes the hook count vary between renders
+  // (React error #300, "rendered fewer hooks than expected").
+
+  if (status === null && busy === 'load') {
+    return React.createElement('div', { className: 'dshtts-section' },
+      React.createElement('h2', { className: 'dshtts-heading' }, t('heading')),
+      React.createElement('p', { className: 'dshtts-intro' }, t('loading')));
+  }
+
+  const percent = volume === null ? 80 : Math.round(clamp01(volume) * 100);
 
   const statusText = status
     ? (status.ready ? t('ready') : (status.loading ? t('modelLoading') : t('notReady')))
@@ -701,34 +781,62 @@ function TtsSection({ api, t }) {
         }, busy === 'rescan' ? t('rescanning') : t('rescan')),
       ),
 
-      // Endpoints as explicit rows. A native <select> was used first, but its
-      // popup inherited system colours and the unselected entries rendered the
-      // same colour as this panel, so the list looked empty.
-      React.createElement('div', { className: 'dshtts-devlist' },
-        React.createElement('button', {
-          type: 'button',
-          className: 'dshtts-devrow' + (configured === '' ? ' dshtts-devrow-on' : ''),
-          onClick: () => chooseDevice(''),
-        },
-          React.createElement('span', { className: 'dshtts-devrow-name' }, t('deviceAuto')),
-          React.createElement('span', { className: 'dshtts-devrow-tag' }, t('deviceAutoHint')),
-        ),
-        rows.length === 0
-          ? React.createElement('div', { className: 'dshtts-hint' }, t('deviceNone'))
-          : rows.map((d, i) => {
-              const name = txt(d, 'name');
-              const host = d.hostapi ? d.hostapi : '';
-              return React.createElement('button', {
-                key: name || String(i),
-                type: 'button',
-                className: 'dshtts-devrow' + (configured === name ? ' dshtts-devrow-on' : ''),
-                onClick: () => chooseDevice(name),
-              },
-                React.createElement('span', { className: 'dshtts-devrow-name' }, name),
-                React.createElement('span', { className: 'dshtts-devrow-tag' },
-                  (d.suggested ? t('deviceRecommended') : '') + host),
-              );
-            }),
+      // Four slot bindings. Each is bound INDEPENDENTLY: `primary`/`backup` are
+      // the two slots used for ordinary announcements, `speakers`/`headphones`
+      // name the two kinds of output. The agent may only ever name these four,
+      // so this is where the user decides what each one actually points at.
+      React.createElement('div', { className: 'dshtts-slots' },
+        slots.map((slot) => {
+          const bound = bindings[slot] || '';
+          const open = editingSlot === slot;
+          const resolved = resolvedFor(bound);
+          return React.createElement('div', { key: slot, className: 'dshtts-slot' },
+            React.createElement('div', { className: 'dshtts-slot-head' },
+              React.createElement('span', { className: 'dshtts-slot-name' }, t('slot_' + slot)),
+              React.createElement('span', { className: 'dshtts-slot-desc' }, t('slotDesc_' + slot)),
+            ),
+            React.createElement('button', {
+              type: 'button',
+              className: 'dshtts-devrow' + (bound ? ' dshtts-devrow-on' : ''),
+              onClick: () => setEditingSlot(open ? '' : slot),
+            },
+              React.createElement('span', { className: 'dshtts-devrow-name' },
+                bound || t('slotDefault')),
+              React.createElement('span', { className: 'dshtts-devrow-tag' },
+                resolved ? resolved : ''),
+            ),
+            open
+              ? React.createElement('div', { className: 'dshtts-devlist' },
+                  React.createElement('button', {
+                    type: 'button',
+                    className: 'dshtts-devrow' + (bound === '' ? ' dshtts-devrow-on' : ''),
+                    onClick: () => { changeBinding(slot, ''); setEditingSlot(''); },
+                  },
+                    React.createElement('span', { className: 'dshtts-devrow-name' }, t('slotDefault')),
+                    React.createElement('span', { className: 'dshtts-devrow-tag' }, t('slotDefaultHint')),
+                  ),
+                  rows.length === 0
+                    ? React.createElement('div', { className: 'dshtts-hint' }, t('deviceNone'))
+                    : rows.map((d, i) => {
+                        const name = txt(d, 'name');
+                        const host = d.hostapi ? d.hostapi : '';
+                        const dead = d.reachable === false;
+                        return React.createElement('button', {
+                          key: name || String(i),
+                          type: 'button',
+                          className: 'dshtts-devrow' + (bound === name ? ' dshtts-devrow-on' : '')
+                            + (dead ? ' dshtts-devrow-dead' : ''),
+                          onClick: () => { changeBinding(slot, name); setEditingSlot(''); },
+                        },
+                          React.createElement('span', { className: 'dshtts-devrow-name' }, name),
+                          React.createElement('span', { className: 'dshtts-devrow-tag' },
+                            (dead ? t('deviceUnreachable') : '') + host),
+                        );
+                      }),
+                )
+              : null,
+          );
+        }),
       ),
       deviceDiag ? React.createElement('div', { className: 'dshtts-hint' },
         `设备来源诊断: status=${deviceDiag.status} / devices=${deviceDiag.devices} / 下拉选项=${deviceDiag.merged}`
@@ -976,6 +1084,17 @@ const CSS = `
   border-color:var(--dsw-alias-state-success-primary, rgba(120,120,120,.5))}
 .dshtts-devrow-name{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .dshtts-devrow-tag{flex:0 0 auto;font-size:11px;color:var(--dsw-alias-label-tertiary, rgba(255,255,255,.55))}
+/* An endpoint Windows reports as inactive (unplugged jack). Dimmed, not hidden:
+   the user still needs to see that it exists to understand why it is skipped. */
+.dshtts-devrow-dead{opacity:.55}
+/* The four slots the agent may name. Stacked cards rather than one list, because
+   each is an independent decision and some are described in one line. */
+.dshtts-slots{display:flex;flex-direction:column;gap:10px}
+.dshtts-slot{display:flex;flex-direction:column;gap:4px;
+  padding:8px;border-radius:8px;border:1px solid var(--dsw-alias-line-secondary, rgba(128,128,128,.18))}
+.dshtts-slot-head{display:flex;flex-direction:column;gap:1px}
+.dshtts-slot-name{font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary,#fff)}
+.dshtts-slot-desc{font-size:11px;color:var(--dsw-alias-label-tertiary, rgba(255,255,255,.55))}
 .dshtts-input{width:100%}
 .dshtts-textarea{resize:vertical;min-height:56px;line-height:1.5}
 .dshtts-input:focus-visible,.dshtts-btn:focus-visible,.dshtts-range:focus-visible,

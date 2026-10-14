@@ -220,7 +220,7 @@ const sha256 = (file) => createHash('sha256').update(readFileSync(file)).digest(
 const EXPECTED_METHODS = [
   'status', 'devices', 'voices', 'importVoice', 'pickAudio', 'deleteVoice',
   'renameVoice', 'setVoiceText', 'setDefaultVoice', 'testVoice', 'speak',
-  'stop', 'setDevice', 'setVolume', 'saveConfig',
+  'stop', 'setDevice', 'setVolume', 'saveConfig', 'setSlotBindings',
 ];
 
 /* ================================================================== *
@@ -302,7 +302,7 @@ async function main() {
   const rmNames = rm.map((m) => m.method);
   note('remoteMethods()', JSON.stringify(rmNames));
   check('remoteMethods() is non-empty (__runInitializers was called)', Array.isArray(rm) && rm.length > 0);
-  check('remoteMethods() has all 15 methods', rmNames.length === EXPECTED_METHODS.length,
+  check('remoteMethods() has all 16 methods', rmNames.length === EXPECTED_METHODS.length,
     `${rmNames.length}/${EXPECTED_METHODS.length}`);
   for (const method of EXPECTED_METHODS) {
     check(`remoteMethods() contains ${method}`, rmNames.includes(method));
@@ -313,7 +313,7 @@ async function main() {
   section('2. typert contracts');
   const contracts = await import(pathToFileURL(join(ROOT, 'lib', 'contracts.js')).href);
   note('descriptors', contracts.descriptors.map((d) => d.id).join(', '));
-  check('15 descriptors', contracts.descriptors.length === EXPECTED_METHODS.length);
+  check('16 descriptors', contracts.descriptors.length === EXPECTED_METHODS.length);
   check('descriptor ids', contracts.descriptors.every((d) => d.id === `dsh-tts-speakout#tts/${d.method}`));
   check('service/namespace === tts', contracts.descriptors.every((d) => d.service === 'tts' && d.namespace === 'tts'));
   check('descriptor methods === remoteMethods', JSON.stringify(contracts.descriptors.map((d) => d.method)) === JSON.stringify(rmNames));
@@ -488,6 +488,49 @@ async function main() {
   const deletedAll = await svc.deleteVoice(voiceId);
   check('deleting the last voice leaves defaultVoice null', deletedAll.ok === true && deletedAll.defaultVoice === null);
 
+  section('4b. slot bindings (the four names the agent may use)');
+  {
+    // Fresh service so the persisted config starts clean.
+    const slotSvc = new TtsSpeakoutService(new Context(), {});
+    const before = slotSvc.config().slotBindings;
+    check('all four slots exist by default',
+      JSON.stringify(Object.keys(before).sort()) === JSON.stringify(['backup', 'headphones', 'primary', 'speakers']));
+    check('slots default to unbound', Object.values(before).every((v) => v === ''));
+
+    const saved = await slotSvc.saveConfig({
+      slotBindings: { primary: '扬声器 (Realtek(R) Audio)', backup: '耳机', speakers: '', headphones: '' },
+    });
+    check('saveConfig accepts slotBindings', saved.ok === true, String(saved.message));
+    const cfg = slotSvc.config().slotBindings;
+    check('primary binding persists', cfg.primary === '扬声器 (Realtek(R) Audio)', cfg.primary);
+    check('backup binding persists', cfg.backup === '耳机', cfg.backup);
+    check('unset slots stay empty strings', cfg.speakers === '' && cfg.headphones === '');
+
+    // A fresh instance must read it back from disk, not from memory.
+    const reread = new TtsSpeakoutService(new Context(), {}).config().slotBindings;
+    check('bindings survive a service restart (read from disk)', reread.primary === cfg.primary && reread.backup === cfg.backup,
+      JSON.stringify(reread));
+
+    // setSlotBindings is a merge: naming one slot must not wipe the others.
+    const merged = await slotSvc.setSlotBindings({ speakers: 'Steam Streaming Speakers' });
+    check('setSlotBindings is a merge, not a replace',
+      merged.ok === true && merged.slotBindings.primary === cfg.primary
+      && merged.slotBindings.backup === cfg.backup
+      && merged.slotBindings.speakers === 'Steam Streaming Speakers',
+      JSON.stringify(merged.slotBindings));
+    check('statusResult carries the bindings and the route chain',
+      Array.isArray(merged.routeChain) && merged.routeChain[0] === 'primary'
+      && merged.routeChain[3] === 'headphones', JSON.stringify(merged.routeChain));
+
+    // Whitespace and junk must not create phantom slots.
+    const cleaned = await slotSvc.saveConfig({ slotBindings: { primary: '  耳机  ', backup: '   ' } });
+    check('bindings are trimmed', cleaned.slotBindings.primary === '耳机', JSON.stringify(cleaned.slotBindings));
+    check('blank bindings normalize to empty', cleaned.slotBindings.backup === '');
+
+    // Reset so later sections see the defaults.
+    await slotSvc.saveConfig({ slotBindings: { primary: '', backup: '', speakers: '', headphones: '' } });
+  }
+
   section('5. agent tools (lib/tools.js)');
   const registered = [];
   const fakeCtx = {
@@ -544,12 +587,29 @@ async function main() {
   check('dsh_speak volume parameter gives loud/quiet examples',
     /0\.9-1/.test(speakTool.parameters.properties.volume.description)
     && /0\.2-0\.3/.test(speakTool.parameters.properties.volume.description));
-  // Same discipline for the channel.
+  // Same discipline for the output slot.
   check('dsh_speak description says to leave device unset by default',
-    /leave the `device` argument UNSET/i.test(speakTool.description)
-    && /explicitly asks for a particular output/i.test(speakTool.description));
+    /leave `device` UNSET/s.test(speakTool.description)
+    && /asked for no particular output/s.test(speakTool.description));
   check('dsh_speak device parameter repeats the default behaviour',
-    /Leave UNSET unless the user explicitly asked for a particular output/i.test(speakTool.parameters.properties.device.description));
+    /Leave UNSET in the normal case/i.test(speakTool.parameters.properties.device.description));
+  // The agent may name ONLY these four slots: no driver or device strings.
+  check('dsh_speak device is restricted to the four slots',
+    JSON.stringify(speakTool.parameters.properties.device.enum)
+      === JSON.stringify(['primary', 'backup', 'speakers', 'headphones']));
+  check('dsh_speak states the four names are the only accepted values',
+    /EXACTLY these four names/s.test(speakTool.description)
+    && /no other value is accepted/i.test(speakTool.parameters.properties.device.description));
+  check('dsh_speak warns against sending a device string',
+    /Never send a driver or device string/s.test(speakTool.description));
+  check('dsh_speak explains primary is the default output',
+    /primary.*默认输出/s.test(speakTool.description));
+  check('dsh_speak explains backup is the fallback slot',
+    /backup.*备用输出/s.test(speakTool.description));
+  check('dsh_speak explains leaving device unset is what enables the fallback',
+    /leaving it unset is what gets the fallback/s.test(speakTool.description));
+  check('dsh_speak forbids substituting another slot for a specific request',
+    /do NOT use `backup` as a substitute/i.test(speakTool.description));
 
   // presentCall preview
   const pc = speakTool.presentCall({ text: '这是一句很长很长很长很长很长很长很长很长很长很长的测试喊话文本' });
@@ -584,8 +644,8 @@ async function main() {
     JSON.stringify(Object.keys(speakResult)) === JSON.stringify(['ok', 'message', 'durationSeconds', 'device', 'deviceIndex', 'voiceId', 'file']));
 
   // An explicit channel must be forwarded verbatim (the worker validates it).
-  await speakTool.execute({ text: 'hello', device: '耳机' });
-  check('dsh_speak forwards an explicit device', speakArgs[4] === '耳机', JSON.stringify(speakArgs));
+  await speakTool.execute({ text: 'hello', device: 'headphones' });
+  check('dsh_speak forwards an explicit slot', speakArgs[4] === 'headphones', JSON.stringify(speakArgs));
   check('dsh_speak forwards volume alongside device', speakArgs[2] === undefined, JSON.stringify(speakArgs));
 
   // dsh_tts_status is the single self-check tool: it reports, it does not throw,

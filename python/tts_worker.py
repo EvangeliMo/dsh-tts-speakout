@@ -98,11 +98,21 @@ class Worker:
     def __init__(self, model_path: str, voices_dir: str | None, data_dir: str | None,
                  device: str = "", volume: float = 0.8, language: str = "Chinese",
                  max_new_tokens: int = 0, auto_pick_speaker: bool = True,
-                 python_path: str | None = None, model_source: str = "auto") -> None:
+                 python_path: str | None = None, model_source: str = "auto",
+                 bindings: dict[str, str] | None = None) -> None:
         self.model_path = model_path
         self.voices_dir = Path(voices_dir) if voices_dir else None
         self.data_dir = Path(data_dir) if data_dir else Path(tempfile.gettempdir()) / "dsh-tts-speakout"
         self.device_spec = device or ""
+        # The user's binding for each of the four slots. Each one names a real
+        # endpoint (or the kind alias); they are independent, so the user decides
+        # what `primary` / `backup` / `speakers` / `headphones` point at.
+        self.bindings = {
+            slot: str((bindings or {}).get(slot, "") or "").strip()
+            for slot in audio_out.SLOT_NAMES
+        }
+        # Which slot actually won the last resolution (shown in status/settings).
+        self.active_source = ""
         self.volume = max(0.0, min(1.0, float(volume)))
         self.language = language or "Chinese"
         self.max_new_tokens = int(max_new_tokens or 0)
@@ -193,26 +203,72 @@ class Worker:
             for row in rows:
                 row["suggested"] = False
         self.devices = rows
-        self.active_device = audio_out.resolve_device(rows, self.device_spec)
+        chosen = self.select_device()
+        self.active_device = chosen["device"] if chosen else None
+        self.active_source = str(chosen.get("used", "")) if chosen else ""
         if self.active_device:
-            log("info", "输出通道: %s (%s)" % (self.active_device["name"], self.active_device["hostapi"]),
+            log("info", "输出通道: %s (%s)%s"
+                % (self.active_device["name"], self.active_device["hostapi"],
+                   (" [来自偏好: %s]" % self.active_source) if self.active_source else ""),
                 {"deviceIndex": self.active_device["index"]})
         else:
             log("warn", "未找到可用的输出设备，将无法发声")
         return rows
+
+    def route_chain(self) -> list[str]:
+        """The ordered slots this worker walks when nothing is pinned.
+
+        Always all four, `primary` first: an unbound slot still resolves through
+        its default, so the chain never stalls and a bound slot is never dead
+        weight.
+        """
+        return audio_out.expand_chain(self.bindings)
+
+    def select_device(self) -> dict[str, Any] | None:
+        """Which endpoint this worker should speak through, by user precedence.
+
+        Order (highest first):
+          1. `device` — an explicit pin the user set, or the channel the host
+             pushed for this session.
+          2. the slot chain: `primary` -> `backup` -> `speakers` -> `headphones`.
+             The first *reachable* slot wins, which is exactly what the fallback
+             slots are for.
+          3. the automatic heuristic (speakers preferred over headsets, virtual
+             cables deprioritised), used when the chain yields nothing.
+        """
+        pin = str(self.device_spec or "").strip()
+        if pin:
+            resolved = audio_out.resolve_device(self.devices, pin, self.bindings)
+            if resolved is not None:
+                return {"device": resolved, "used": pin, "slot": audio_out.slot_of(pin), "index": -1}
+            # A pin outranks the chain, but a pin that cannot be opened must not
+            # silence the plugin entirely; fall through and say so.
+            log("warn", "指定通道当前不可用（%s），改走槽位链或自动选择" % pin)
+
+        chain = self.route_chain()
+        if chain:
+            picked = audio_out.resolve_chain(self.devices, chain, self.bindings)
+            if picked is not None:
+                return picked
+            log("warn", "槽位链里没有任何可用端口，回退到自动选择")
+
+        resolved = audio_out.resolve_device(self.devices, None, self.bindings)
+        if resolved is None:
+            return None
+        return {"device": resolved, "used": "", "slot": "", "index": -1}
 
     def resolve_device_index(self) -> int:
         if not self.devices:
             self.refresh_devices()
         # Probe-based: an endpoint that cannot be opened must never be selected,
         # or a speak-out would "succeed" while producing no sound.
-        candidates = audio_out.devices_for_spec(self.devices, self.device_spec)
-        if not candidates:
+        chosen = self.select_device()
+        if chosen is None:
             raise audio_out.AudioError(
-                "指定的输出通道当前不可用（%s）。可用通道: %s"
-                % (self.device_spec or "自动", self.device_names() or "（枚举不到任何输出设备）")
+                "找不到任何可用的输出通道。请检查系统音频设备是否正常。"
             )
-        self.active_device = candidates[0]
+        self.active_device = chosen["device"]
+        self.active_source = str(chosen.get("used", ""))
         return int(self.active_device["index"])
 
     def device_names(self, limit: int = 12, reachable_only: bool = True) -> str:
@@ -242,17 +298,19 @@ class Worker:
         return ", ".join(names)
 
     def resolve_explicit_device(self, device: str) -> int:
-        """Validate a caller-requested output channel and return its index.
+        """Validate an explicitly requested output and return its index.
 
-        Re-enumerates the OS first: this runs as a pre-flight check on every
-        speak-out, and the whole point is to fail fast when a channel is not
-        actually usable (headphones unplugged, device disabled), so the cached
-        list is not good enough.
+        `device` is normally one of the four slot names (`primary` / `backup` /
+        `speakers` / `headphones`); a raw device name is still accepted so a user
+        can point at one exact endpoint. Re-enumerates the OS first: this runs as a
+        pre-flight check before synthesis, and the point is to fail fast when the
+        request cannot be honoured.
 
-        Availability is decided by actually opening the endpoint, not by its
-        name: the Realtek headphone jack is enumerated as "耳机 ()" even when
-        nothing is plugged in, so a name test would happily accept it. Raises
-        AudioError when the channel cannot be used.
+        STRICT BY DESIGN: a slot that cannot resolve raises instead of falling back
+        to another output. Silently speaking through a different port would make
+        the user believe they heard the one they asked for. Availability is decided
+        by actually opening the endpoint, not by its name, because the Realtek
+        headphone jack is enumerated even with nothing plugged in.
         """
         spec = str(device or "").strip()
         self.refresh_devices()
@@ -261,10 +319,27 @@ class Worker:
                 "当前枚举不到任何音频输出设备，无法确定输出通道「%s」是否可用。" % spec
             )
 
+        slot = audio_out.slot_of(spec)
+        if slot:
+            working = audio_out.port_candidates(self.devices, slot, self.bindings)
+            if not working:
+                bound = str(self.bindings.get(slot, "") or "")
+                detail = ("（槽位绑定为「%s」）" % bound) if bound else "（未绑定，按类型自动判断）"
+                raise audio_out.AudioError(
+                    "输出槽位 %s 当前没有可用端点%s。"
+                    "可用通道: %s"
+                    % (slot, detail, self.device_names())
+                )
+            self.active_device = working[0]
+            log("info", "按调用方要求使用槽位 %s -> %s (%s)"
+                % (slot, self.active_device["name"], self.active_device["hostapi"]))
+            return int(self.active_device["index"])
+
         matches = audio_out.name_matches_candidates(self.devices, spec)
         if not matches:
             raise audio_out.AudioError(
-                "指定的输出通道不存在（%s）。可用通道: %s" % (spec, self.device_names())
+                "指定的输出通道不存在（%s）。可用槽位: %s。可用通道: %s"
+                % (spec, ", ".join(audio_out.SLOT_NAMES), self.device_names())
             )
 
         working = audio_out.devices_for_spec(self.devices, spec)
@@ -542,6 +617,10 @@ class Worker:
             "device_b64": b64(self.active_device["name"] if self.active_device else ""),
             "deviceIndex": self.active_device["index"] if self.active_device else None,
             "deviceSpec": self.device_spec,
+            "deviceSource": self.active_source,
+            "deviceSource_b64": b64(self.active_source),
+            "slotBindings": dict(self.bindings),
+            "routeChain": self.route_chain(),
             "volume": self.volume,
             "language": self.language,
             "autoPickSpeaker": self.auto_pick_speaker,
@@ -563,7 +642,10 @@ class Worker:
         if include_devices:
             payload["devices"] = [
                 {"index": d["index"], "name_b64": b64(d["name"]), "hostapi": d["hostapi"],
-                 "suggested": d.get("suggested", False), "virtual": d.get("virtual", False)}
+                 "suggested": d.get("suggested", False), "virtual": d.get("virtual", False),
+                 # Reachability is what the settings page needs to grey out a
+                 # jack with nothing plugged in.
+                 "reachable": d.get("reachable")}
                 for d in self.devices
             ]
         return payload
@@ -584,6 +666,12 @@ def handle(worker: Worker, request: dict[str, Any]) -> dict[str, Any]:
     if op == "set_device" or op == "set_config":
         if "device" in request:
             worker.device_spec = str(request.get("device") or "")
+        if "slotBindings" in request:
+            raw = request.get("slotBindings") or {}
+            worker.bindings = {
+                slot: str((raw or {}).get(slot, "") or "").strip()
+                for slot in audio_out.SLOT_NAMES
+            }
         if request.get("volume") is not None:
             worker.volume = max(0.0, min(1.0, float(request["volume"])))
         if request.get("language"):
@@ -689,6 +777,7 @@ def main(argv: list[str]) -> int:
         auto_pick_speaker=str(args.get("auto-pick-speaker", "true")).lower() != "false",
         python_path=args.get("python"),
         model_source=args.get("model-source") or "auto",
+        bindings=_parse_bindings(args.get("slot-bindings")),
     )
 
     try:
@@ -727,6 +816,24 @@ def main(argv: list[str]) -> int:
 
     worker._speaker.close()
     return 0
+
+
+def _parse_bindings(raw: str | None) -> dict[str, str]:
+    """Decode the `--slot-bindings` argument.
+
+    Format: `slot=device` pairs joined by '\\x1f' (unit separator, which cannot
+    occur in a device name), so the four bindings travel as one argv entry and
+    no escaping scheme is needed for spaces or non-ASCII names.
+    """
+    out: dict[str, str] = {}
+    for chunk in str(raw or "").split("\x1f"):
+        if not chunk:
+            continue
+        slot, _, value = chunk.partition("=")
+        key = audio_out.slot_of(slot)
+        if key and value:
+            out[key] = value
+    return out
 
 
 def _parse_args(argv: list[str]) -> dict[str, Any]:
