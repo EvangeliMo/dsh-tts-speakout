@@ -207,9 +207,48 @@ class Worker:
         chosen = audio_out.resolve_device(self.devices, self.device_spec)
         if chosen is None:
             raise audio_out.AudioError(
-                "指定的输出通道不可用（%s）。请运行 dsh_tts_devices 查看可用通道。" % (self.device_spec or "自动")
+                "指定的输出通道不可用（%s）。可用通道: %s"
+                % (self.device_spec or "自动", self.device_names() or "（枚举不到任何输出设备）")
             )
         self.active_device = chosen
+        return int(chosen["index"])
+
+    def device_names(self, limit: int = 12) -> str:
+        """Friendly names of the endpoints that currently exist, for error text.
+
+        Included so a caller that asked for a wrong channel learns the valid
+        names from the same reply instead of guessing repeatedly.
+        """
+        names = [str(d.get("name") or "") for d in self.devices]
+        names = [n for n in names if n]
+        if not names:
+            return ""
+        if len(names) > limit:
+            return ", ".join(names[:limit]) + " 等 %d 个" % len(names)
+        return ", ".join(names)
+
+    def resolve_explicit_device(self, device: str) -> int:
+        """Validate a caller-requested output channel and return its index.
+
+        Re-enumerates the OS first: this runs as a pre-flight check on every
+        speak-out, and the whole point is to fail fast when a channel has since
+        disappeared (headphones unplugged, device disabled), so the cached list
+        is not good enough. Raises AudioError when the channel is unavailable.
+        """
+        spec = str(device or "").strip()
+        self.refresh_devices()
+        if not self.devices:
+            raise audio_out.AudioError(
+                "当前枚举不到任何音频输出设备，无法确定输出通道「%s」是否可用。" % spec
+            )
+        chosen = audio_out.resolve_device(self.devices, spec)
+        if chosen is None:
+            raise audio_out.AudioError(
+                "指定的输出通道不可用（%s）。可用通道: %s" % (spec, self.device_names())
+            )
+        self.active_device = chosen
+        log("info", "按调用方要求使用输出通道: %s (%s)"
+            % (chosen["name"], chosen["hostapi"]))
         return int(chosen["index"])
 
     # ------------------------------------------------------------ voices
@@ -394,14 +433,32 @@ class Worker:
                                         if self.active_device else index))
         return ok
 
-    def play_file(self, path: str, volume: float | None = None) -> dict[str, Any]:
+    def play_file(self, path: str, volume: float | None = None,
+                  device: str | None = None,
+                  validate_only: bool = False) -> dict[str, Any]:
+        """Play a wav, or (with `validate_only`) merely validate the endpoint.
+
+        `device` is an optional caller-requested channel; when given it is
+        pre-flight checked here. `validate_only` exists so a caller can confirm
+        the channel is usable BEFORE paying for synthesis: the check must be
+        cheap so an unavailable channel fails fast.
+        """
+        spec = str(device or "").strip()
+        index = (self.resolve_explicit_device(spec) if spec
+                 else self.resolve_device_index())
+        if validate_only:
+            return {
+                "validated": True,
+                "device": self.active_device["name"] if self.active_device else None,
+                "deviceIndex": index,
+            }
+
         _protect_stdout()
         import soundfile as sf  # noqa: PLC0415
 
         if not Path(path).is_file():
             raise ValueError("音频文件不存在: %s" % path)
         samples, sr = sf.read(path, dtype="float32", always_2d=False)
-        index = self.resolve_device_index()
         gain = self.volume if volume is None else max(0.0, min(1.0, float(volume)))
         started = time.time()
         with self._play_lock:
@@ -531,6 +588,18 @@ def handle(worker: Worker, request: dict[str, Any]) -> dict[str, Any]:
         voice = worker.find_voice(request.get("voice_id"))
         if voice is None:
             raise ValueError("还没有任何音色。请先在插件设置里导入一段母本音频。")
+
+        # Pre-flight the output channel BEFORE synthesizing. Synthesis costs
+        # seconds (and a cold model load costs ~10s), so discovering only
+        # afterwards that the requested channel does not exist wastes the
+        # caller's time and returns a confusing "rendered fine but unusable"
+        # result. `validate_only` makes the check cheap and immediate.
+        requested_device = unb64(request.get("device_b64")) or str(request.get("device") or "")
+        try:
+            worker.play_file("", None, requested_device or None, validate_only=True)
+        except audio_out.AudioError as exc:
+            raise ValueError(str(exc)) from exc
+
         path, info = worker.synthesize(text, voice, request.get("language"),
                                        request.get("max_new_tokens"))
         payload = {"file": path, "file_b64": b64(path), "path_b64": b64(path)}
@@ -543,16 +612,19 @@ def handle(worker: Worker, request: dict[str, Any]) -> dict[str, Any]:
             payload["playedMs"] = 0
             payload["device"] = (worker.active_device["name"]
                                  if worker.active_device else None)
+            payload["deviceIndex"] = (worker.active_device["index"]
+                                      if worker.active_device else None)
             payload["volume"] = worker.volume
             return payload
 
-        # Resolve the endpoint BEFORE announcing playback, so the event carries
-        # the device we are actually about to open.
-        worker.resolve_device_index()
+        # The channel was already resolved by the pre-flight above, and
+        # play_file re-resolves the same spec, so the announced device is the
+        # one actually opened.
         _emit({"type": "playing", "started": True, "file": path,
                "duration": info["duration"], "device": worker.active_device["name"]
                if worker.active_device else None})
-        played = worker.play_file(path, request.get("volume"))
+        played = worker.play_file(path, request.get("volume"),
+                                  requested_device or None)
         _emit({"type": "played", "started": False, "file": path, **played})
         payload.update({k: v for k, v in played.items() if k in ("device", "volume", "playedMs")})
         return payload

@@ -514,14 +514,26 @@ async function main() {
   }
   const speakTool = registered.find((t) => t.name === 'dsh_speak');
   check('dsh_speak tells the model to use the SPEAKERS', /SPEAKER|扬声器/.test(speakTool.description));
-  check('dsh_speak mentions notifying an absent user', /may not be (sitting )?at the computer|away from the desk/i.test(speakTool.description));
+  check('dsh_speak mentions notifying a user who stepped away',
+    /stepping away from the computer/i.test(speakTool.description)
+    || /away from the desk/i.test(speakTool.description));
   check('dsh_speak timeoutMs 300000', speakTool.timeoutMs === 300000);
-  // Permission narrowing: no voice and no wait parameter may exist.
-  check('dsh_speak parameters are text + volume only',
-    JSON.stringify(Object.keys(speakTool.parameters.properties ?? {})) === JSON.stringify(['text', 'volume']));
+  // Permission narrowing: no voice and no wait parameter may exist. `device` is
+  // allowed but must stay optional and prompt-guarded (see the checks below).
+  check('dsh_speak parameters are text + volume + device only',
+    JSON.stringify(Object.keys(speakTool.parameters.properties ?? {})) === JSON.stringify(['text', 'volume', 'device']));
   check('dsh_speak has NO voice parameter', !('voice' in (speakTool.parameters.properties ?? {})));
   check('dsh_speak has NO wait parameter', !('wait' in (speakTool.parameters.properties ?? {})));
   check('dsh_speak text is required', JSON.stringify(speakTool.parameters.required ?? []) === JSON.stringify(['text']));
+  check('dsh_speak device is NOT required', !(speakTool.parameters.required ?? []).includes('device'));
+  // The prompt must gate the whole tool on an explicit user request, or it turns
+  // into an uninvited noise-maker.
+  check('dsh_speak gates itself on an explicit user request',
+    /ONLY when/i.test(speakTool.description)
+    && /explicitly asked to be notified by voice/i.test(speakTool.description)
+    && /stepping away/i.test(speakTool.description));
+  check('dsh_speak warns against calling it just because a task was long',
+    /Do NOT call it just because a task was long/i.test(speakTool.description));
   // The volume prompt must teach "leave it unset unless asked": without it the
   // model guesses a level and overrides the user's own configuration.
   check('dsh_speak description says to leave volume unset by default',
@@ -532,6 +544,12 @@ async function main() {
   check('dsh_speak volume parameter gives loud/quiet examples',
     /0\.9-1/.test(speakTool.parameters.properties.volume.description)
     && /0\.2-0\.3/.test(speakTool.parameters.properties.volume.description));
+  // Same discipline for the channel.
+  check('dsh_speak description says to leave device unset by default',
+    /leave the `device` argument UNSET/i.test(speakTool.description)
+    && /explicitly asks for a particular output/i.test(speakTool.description));
+  check('dsh_speak device parameter repeats the default behaviour',
+    /Leave UNSET unless the user explicitly asked for a particular output/i.test(speakTool.parameters.properties.device.description));
 
   // presentCall preview
   const pc = speakTool.presentCall({ text: '这是一句很长很长很长很长很长很长很长很长很长很长的测试喊话文本' });
@@ -550,15 +568,25 @@ async function main() {
   fakeCtx.tts = {
     speak: async (...args) => {
       speakArgs = args;
-      return { ok: true, message: 'ok', durationSeconds: 2.5, device: '扬声器', voiceId: 'v1', file: 'C:\\x.wav' };
+      return {
+        ok: true, message: 'ok', durationSeconds: 2.5, device: '扬声器',
+        deviceIndex: 34, voiceId: 'v1', file: 'C:\\x.wav',
+      };
     },
   };
   const speakResult = await speakTool.execute({ text: 'hello' });
   check('dsh_speak passes NO voice (null = user setting)', speakArgs[1] === null, JSON.stringify(speakArgs));
   check('dsh_speak always waits for playback', speakArgs[3] === true, JSON.stringify(speakArgs));
+  check('dsh_speak omits device when the caller gave none', speakArgs[4] === undefined, JSON.stringify(speakArgs));
   check('dsh_speak normal result', speakResult.ok === true && speakResult.durationSeconds === 2.5 && speakResult.voiceId === 'v1');
+  check('dsh_speak surfaces the resolved device index', speakResult.deviceIndex === 34, String(speakResult.deviceIndex));
   check('dsh_speak result has exactly the declared keys',
-    JSON.stringify(Object.keys(speakResult)) === JSON.stringify(['ok', 'message', 'durationSeconds', 'device', 'voiceId', 'file']));
+    JSON.stringify(Object.keys(speakResult)) === JSON.stringify(['ok', 'message', 'durationSeconds', 'device', 'deviceIndex', 'voiceId', 'file']));
+
+  // An explicit channel must be forwarded verbatim (the worker validates it).
+  await speakTool.execute({ text: 'hello', device: '耳机' });
+  check('dsh_speak forwards an explicit device', speakArgs[4] === '耳机', JSON.stringify(speakArgs));
+  check('dsh_speak forwards volume alongside device', speakArgs[2] === undefined, JSON.stringify(speakArgs));
 
   // dsh_tts_status is the single self-check tool: it reports, it does not throw,
   // and it must not expose any mutating method.
@@ -591,6 +619,10 @@ async function main() {
   const unitSvc = new TtsSpeakoutService(new Context(), {});
   const sent = [];
   unitSvc.ensureReady = async () => ({ ok: true });
+  // Stub the child-process layer as well: `ensureReady` now runs the first-run
+  // bootstrap, and its `worker.ensure()` fallback would spawn a real python
+  // process here (slow, and irrelevant to request shaping).
+  unitSvc.worker.ensure = async () => ({ ok: true });
   unitSvc.worker.request = async (op, payload) => {
     sent.push({ op, payload });
     return {

@@ -57,8 +57,14 @@ plugin_manager install_bundle  D:\path\to\dsh-tts-speakout
 
 | 工具 | 能力 |
 |---|---|
-| `dsh_speak(text, volume?)` | **唯一的动作工具**：说一句话 |
+| `dsh_speak(text, volume?, device?)` | **唯一的动作工具**：说一句话 |
 | `dsh_tts_status()` | **唯一的自检工具**：只读报告，不做任何操作 |
+
+**它什么时候才说话**（提示词里写死了触发条件，避免变成不请自来的噪音源）：
+
+只有用户**明确要求语音通知**、**说自己离开电脑但希望有事能被喊到**、或**让你用"说出来"的方式提醒他任何事**时，
+模型才会调用。**仅仅"任务跑了很久"不足以触发**——没有上述明确要求时，它会静默收尾。
+它也不是通用的"播放音频"工具。
 
 **权限是刻意收窄的**，因为"让 agent 能对着扬声器说话"本身就是一种有分量的能力：
 
@@ -66,12 +72,16 @@ plugin_manager install_bundle  D:\path\to\dsh-tts-speakout
 |---|---|
 | 决定说什么 | ❌ 选择音色（**音色永远跟随你的设置**） |
 | 本次临时音量（不持久化） | ❌ 修改你的音量设置 |
-| 只读查询当前音色/音量/通道 | ❌ 切换输出通道（连参数都没有） |
-| —— | ❌ 导入、重命名、删除音色 |
+| 本次临时输出通道（仅当你明确要求换通道） | ❌ 修改你的通道设置 |
+| 只读查询当前音色/音量/通道 | ❌ 导入、重命名、删除音色 |
 
-两点行为约定：
+三条行为约定：
 
 - **`dsh_speak` 一定等到播完才返回**，所以返回成功＝真的念完了，模型不会误以为已经说过。
+- **参数默认全部留空**：`volume` 与 `device` 在正常情况下都**不该被填**，会使用你设置的值。
+  只有你在对话里明确要求（"大声点" / "从耳机里说"）时才允许本次覆盖，且**不持久化**。
+- **通道不可用会立刻报错**：工具在合成**之前**先校验目标输出通道，不可用则**毫秒级返回**
+  错误并列出实际存在的通道名——不会让你等十几秒模型加载后才发现选错了输出口。
 - `dsh_tts_status` **永不修改任何设置**。你问模型"我怎么没听到"，它用这一个工具就能看到
   当前音色、音量、将使用的输出通道，以及"端点被静音/音量为 0"这类**听不到的风险**。
 
@@ -188,7 +198,7 @@ Qwen3-TTS 是**零样本克隆**：给一段参考音频，它就用那个音色
 ```bash
 node scripts/build-client.mjs          # 生成 lib/client.js（改了 src/client 必须重建，产物要提交）
 node scripts/build-client.mjs --check  # 校验产物是否陈旧
-node scripts/test-host.mjs             # 宿主回归（125 项断言）
+node scripts/test-host.mjs             # 宿主回归（149 项断言）
 node scripts/probe-preview.mjs         # 试听链路（真实合成 + 真实播放）
 node scripts/worker-probe.mjs          # worker 端到端
 node scripts/check-reference.py <wav>  # 母本素材质量检查
@@ -259,7 +269,7 @@ dsh-tts-speakout/
 │   └── env_bootstrap.py   首次运行自举：找/建环境、装依赖、下模型
 └── scripts/
     ├── build-client.mjs   构建客户端产物
-    ├── test-host.mjs      宿主冒烟（133 项断言）
+    ├── test-host.mjs      宿主冒烟（149 项断言）
     ├── probe-preview.mjs  试听链路（真实合成 + 真实播放）
     ├── worker-probe.mjs   worker 真机端到端
     ├── voice-probe.mjs    用指定母本合成并播放
