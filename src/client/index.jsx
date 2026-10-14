@@ -531,15 +531,20 @@ function TtsSection({ api, t }) {
    * is a device-name substring, and an empty binding means "use this slot's
    * default" (speaker-like for `speakers`, headset-like for `headphones`, the
    * automatic pick for `primary`/`backup`).
+   *
+   * NOT a hook on purpose. As a `React.useCallback` this ran during the hook
+   * phase, before the `rows` const below was initialized, and every render threw
+   * "Cannot access 'rows' before initialization". It is plain derivation, so it
+   * takes the rows it needs as an argument.
    */
-  const resolvedFor = React.useCallback((bound) => {
+  function resolvedFor(bound, rows) {
     if (!bound) return '';
     const needle = String(bound).toLowerCase();
     const hit = (rows || []).find((d) => txt(d, 'name').toLowerCase().includes(needle));
     if (!hit) return t('bindingMissing');
     if (hit.reachable === false) return t('bindingUnreachable');
     return t('bindingOk');
-  }, [rows, t]);
+  }
 
   /* ---- block 2: volume ---- */
 
@@ -786,10 +791,10 @@ function TtsSection({ api, t }) {
       // name the two kinds of output. The agent may only ever name these four,
       // so this is where the user decides what each one actually points at.
       React.createElement('div', { className: 'dshtts-slots' },
-        slots.map((slot) => {
+        SLOTS.map((slot) => {
           const bound = bindings[slot] || '';
           const open = editingSlot === slot;
-          const resolved = resolvedFor(bound);
+          const resolved = resolvedFor(bound, rows);
           return React.createElement('div', { key: slot, className: 'dshtts-slot' },
             React.createElement('div', { className: 'dshtts-slot-head' },
               React.createElement('span', { className: 'dshtts-slot-name' }, t('slot_' + slot)),

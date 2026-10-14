@@ -209,7 +209,7 @@ class Worker:
         if self.active_device:
             log("info", "输出通道: %s (%s)%s"
                 % (self.active_device["name"], self.active_device["hostapi"],
-                   (" [来自偏好: %s]" % self.active_source) if self.active_source else ""),
+                   (" [来自槽位: %s]" % self.active_source) if self.active_source else ""),
                 {"deviceIndex": self.active_device["index"]})
         else:
             log("warn", "未找到可用的输出设备，将无法发声")
@@ -736,6 +736,7 @@ def handle(worker: Worker, request: dict[str, Any]) -> dict[str, Any]:
                                  if worker.active_device else None)
             payload["deviceIndex"] = (worker.active_device["index"]
                                       if worker.active_device else None)
+            payload["deviceSource"] = worker.active_source
             payload["volume"] = worker.volume
             return payload
 
@@ -749,6 +750,9 @@ def handle(worker: Worker, request: dict[str, Any]) -> dict[str, Any]:
                                   requested_device or None)
         _emit({"type": "played", "started": False, "file": path, **played})
         payload.update({k: v for k, v in played.items() if k in ("device", "volume", "playedMs")})
+        # Which slot of the chain won, so an automatic primary->backup fallback
+        # reaches the caller instead of being invisible.
+        payload["deviceSource"] = worker.active_source
         return payload
 
     if op == "shutdown":

@@ -641,7 +641,7 @@ async function main() {
   check('dsh_speak normal result', speakResult.ok === true && speakResult.durationSeconds === 2.5 && speakResult.voiceId === 'v1');
   check('dsh_speak surfaces the resolved device index', speakResult.deviceIndex === 34, String(speakResult.deviceIndex));
   check('dsh_speak result has exactly the declared keys',
-    JSON.stringify(Object.keys(speakResult)) === JSON.stringify(['ok', 'message', 'durationSeconds', 'device', 'deviceIndex', 'voiceId', 'file']));
+    JSON.stringify(Object.keys(speakResult)) === JSON.stringify(['ok', 'message', 'durationSeconds', 'device', 'deviceIndex', 'deviceSource', 'voiceId', 'file']));
 
   // An explicit channel must be forwarded verbatim (the worker validates it).
   await speakTool.execute({ text: 'hello', device: 'headphones' });

@@ -13,6 +13,13 @@ __pycache__/
 # Local scratch used by scripts/test-host.mjs (fake $DSH_HOME)
 .test-home/
 
+# Scratch dirs created INSIDE the checkout by tooling that bundles the client for
+# inspection. They use mkdtempSync, which leaves the directory behind when the
+# script exits early — one such bundle (54 KB of generated JS) was nearly
+# committed, hence the explicit patterns.
+.diag-*/
+.render-check-*/
+
 # Runtime output of the inference worker when pointed at the checkout
 python/out/
 venv/
